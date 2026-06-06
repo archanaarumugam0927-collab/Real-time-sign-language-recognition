@@ -1,0 +1,273 @@
+"""
+============================================================
+  SIGN LANGUAGE — Data Collection (Append Mode)
+  Automatically detects how many sequences already exist
+  and continues from where you left off.
+  Safe to run multiple times — never overwrites old data.
+============================================================
+"""
+
+import cv2
+import numpy as np
+import mediapipe as mp
+import os
+
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL']  = '2'
+
+# ── CONFIG ───────────────────────────────────────────────────────────────────
+SIGNS           = np.array(['Hello', 'Thanks', 'ILoveYou', 'Yes', 'No', 'Help'])
+TARGET_TOTAL    = 60      # ← target sequences per sign (was 30, now 60)
+SEQUENCE_LENGTH = 30      # frames per sequence — must stay the same as before
+DATA_PATH       = 'MP_Data'
+
+# ── MEDIAPIPE SETUP ──────────────────────────────────────────────────────────
+mp_holistic = mp.solutions.holistic
+mp_drawing  = mp.solutions.drawing_utils
+
+def mediapipe_detection(image, model):
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image.flags.writeable = False
+    results = model.process(image)
+    image.flags.writeable = True
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    return image, results
+
+def draw_styled_landmarks(image, results):
+    # Face mesh — updated API for mediapipe 0.10.x
+    if results.face_landmarks:
+        mp_drawing.draw_landmarks(
+            image, results.face_landmarks,
+            mp.solutions.face_mesh.FACEMESH_CONTOURS,
+            mp_drawing.DrawingSpec(color=(80, 110, 10),  thickness=1, circle_radius=1),
+            mp_drawing.DrawingSpec(color=(80, 256, 121), thickness=1, circle_radius=1)
+        )
+    if results.pose_landmarks:
+        mp_drawing.draw_landmarks(
+            image, results.pose_landmarks,
+            mp.solutions.pose.POSE_CONNECTIONS,
+            mp_drawing.DrawingSpec(color=(80, 22, 10),   thickness=2, circle_radius=4),
+            mp_drawing.DrawingSpec(color=(80, 44, 121),  thickness=2, circle_radius=2)
+        )
+    if results.left_hand_landmarks:
+        mp_drawing.draw_landmarks(
+            image, results.left_hand_landmarks,
+            mp.solutions.hands.HAND_CONNECTIONS,
+            mp_drawing.DrawingSpec(color=(121, 22, 76),  thickness=2, circle_radius=4),
+            mp_drawing.DrawingSpec(color=(121, 44, 250), thickness=2, circle_radius=2)
+        )
+    if results.right_hand_landmarks:
+        mp_drawing.draw_landmarks(
+            image, results.right_hand_landmarks,
+            mp.solutions.hands.HAND_CONNECTIONS,
+            mp_drawing.DrawingSpec(color=(245, 117, 66), thickness=2, circle_radius=4),
+            mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=2)
+        )
+
+def extract_keypoints(results):
+    pose = np.array([[lm.x, lm.y, lm.z, lm.visibility]
+                     for lm in results.pose_landmarks.landmark]).flatten() \
+           if results.pose_landmarks else np.zeros(33 * 4)
+    face = np.array([[lm.x, lm.y, lm.z]
+                     for lm in results.face_landmarks.landmark]).flatten() \
+           if results.face_landmarks else np.zeros(468 * 3)
+    lh   = np.array([[lm.x, lm.y, lm.z]
+                     for lm in results.left_hand_landmarks.landmark]).flatten() \
+           if results.left_hand_landmarks else np.zeros(21 * 3)
+    rh   = np.array([[lm.x, lm.y, lm.z]
+                     for lm in results.right_hand_landmarks.landmark]).flatten() \
+           if results.right_hand_landmarks else np.zeros(21 * 3)
+    return np.concatenate([pose, face, lh, rh])  # (1662,)
+
+# ── COUNT EXISTING SEQUENCES ─────────────────────────────────────────────────
+def count_existing_sequences(sign):
+    """
+    Scan the MP_Data/<sign>/ folder and return how many
+    complete sequences already exist.
+    A sequence is complete if it has SEQUENCE_LENGTH .npy files inside.
+    """
+    sign_path = os.path.join(DATA_PATH, sign)
+    if not os.path.exists(sign_path):
+        return 0
+
+    count = 0
+    for folder in os.listdir(sign_path):
+        folder_path = os.path.join(sign_path, folder)
+        if os.path.isdir(folder_path):
+            npy_files = [f for f in os.listdir(folder_path) if f.endswith('.npy')]
+            if len(npy_files) == SEQUENCE_LENGTH:
+                count += 1
+    return count
+
+# ── HUD ──────────────────────────────────────────────────────────────────────
+def draw_hud(image, sign, sequence, total_existing, frame_num, collecting):
+    h, w = image.shape[:2]
+
+    # Top bar
+    cv2.rectangle(image, (0, 0), (w, 65), (0, 0, 0), -1)
+
+    # Sign name + overall progress
+    cv2.putText(image,
+                f'Sign: {sign}   [{total_existing + sequence + 1}/{TARGET_TOTAL}]',
+                (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                (0, 255, 180), 2, cv2.LINE_AA)
+
+    # Frame counter
+    cv2.putText(image,
+                f'Sequence: {total_existing + sequence + 1}   Frame: {frame_num + 1}/{SEQUENCE_LENGTH}',
+                (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (200, 200, 200), 1, cv2.LINE_AA)
+
+    # Recording dot
+    if collecting:
+        cv2.circle(image, (w - 30, 28), 10, (0, 0, 255), -1)
+        cv2.putText(image, 'REC', (w - 72, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+    else:
+        cv2.putText(image,
+                    'Press any key when ready',
+                    (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 255, 0), 1, cv2.LINE_AA)
+
+    # Progress bar at bottom
+    total_done   = total_existing + (sequence if collecting else sequence)
+    bar_w        = int(w * (total_done / TARGET_TOTAL))
+    cv2.rectangle(image, (0, h - 8), (w, h),     (50, 50, 50), -1)
+    cv2.rectangle(image, (0, h - 8), (bar_w, h), (0, 200, 100), -1)
+
+# ── MAIN ─────────────────────────────────────────────────────────────────────
+def collect_data():
+
+    # ── Print summary of what will be collected ──
+    print("\n" + "="*55)
+    print("  SIGN LANGUAGE DATA COLLECTION — APPEND MODE")
+    print("="*55)
+    needs_collection = False
+    for sign in SIGNS:
+        existing = count_existing_sequences(sign)
+        needed   = max(0, TARGET_TOTAL - existing)
+        status   = "DONE" if needed == 0 else f"need {needed} more"
+        print(f"  {sign:<12} : {existing:>2} existing  →  {status}")
+        if needed > 0:
+            needs_collection = True
+    print("="*55)
+
+    if not needs_collection:
+        print("\n  All signs already have 60 sequences. Nothing to collect!")
+        return
+
+    input("\n  Press Enter to open webcam and start...")
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[ERROR] Cannot open webcam.")
+        return
+
+    with mp_holistic.Holistic(
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    ) as holistic:
+
+        for sign in SIGNS:
+            existing = count_existing_sequences(sign)
+            needed   = TARGET_TOTAL - existing
+
+            if needed <= 0:
+                print(f"\n  [{sign}] Already has {existing} sequences — skipping.")
+                continue
+
+            print(f"\n{'='*55}")
+            print(f"  Collecting {needed} new sequences for: {sign.upper()}")
+            print(f"  (already have {existing}, going up to {TARGET_TOTAL})")
+            print(f"{'='*55}")
+
+            # Create folders for new sequences only
+            for seq_idx in range(needed):
+                folder = os.path.join(DATA_PATH, sign,
+                                      str(existing + seq_idx))
+                os.makedirs(folder, exist_ok=True)
+
+            for seq_idx in range(needed):
+                global_seq_num = existing + seq_idx
+
+                # ── WAIT SCREEN ──
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frame        = cv2.flip(frame, 1)
+                    image, results = mediapipe_detection(frame, holistic)
+                    draw_styled_landmarks(image, results)
+                    draw_hud(image, sign, seq_idx, existing, 0, collecting=False)
+
+                    # Centred instruction
+                    text = f'Ready for: {sign}  (seq {global_seq_num + 1}/{TARGET_TOTAL})'
+                    (tw, th), _ = cv2.getTextSize(
+                        text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
+                    tx = (image.shape[1] - tw) // 2
+                    ty = image.shape[0] // 2
+                    cv2.putText(image, text, (tx, ty),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                                (0, 255, 255), 2, cv2.LINE_AA)
+
+                    cv2.imshow('Data Collection', image)
+                    key = cv2.waitKey(10) & 0xFF
+                    if key == ord('q'):
+                        print("\n[INFO] Quit by user.")
+                        cap.release()
+                        cv2.destroyAllWindows()
+                        return
+                    if key != 255:
+                        break
+
+                # ── RECORD ──
+                for frame_num in range(SEQUENCE_LENGTH):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frame          = cv2.flip(frame, 1)
+                    image, results = mediapipe_detection(frame, holistic)
+                    draw_styled_landmarks(image, results)
+                    draw_hud(image, sign, seq_idx, existing, frame_num, collecting=True)
+
+                    cv2.imshow('Data Collection', image)
+                    cv2.waitKey(1)
+
+                    keypoints  = extract_keypoints(results)
+                    save_path  = os.path.join(DATA_PATH, sign,
+                                              str(global_seq_num),
+                                              str(frame_num))
+                    np.save(save_path, keypoints)
+
+                print(f"  [SAVED] {sign}/seq{global_seq_num}  "
+                      f"({global_seq_num + 1}/{TARGET_TOTAL})")
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    # ── Final count ──
+    print("\n" + "="*55)
+    print("  COLLECTION COMPLETE — Final counts:")
+    print("="*55)
+    all_done = True
+    for sign in SIGNS:
+        count = count_existing_sequences(sign)
+        status = "READY" if count >= TARGET_TOTAL else f"INCOMPLETE ({count}/{TARGET_TOTAL})"
+        print(f"  {sign:<12} : {count} sequences  [{status}]")
+        if count < TARGET_TOTAL:
+            all_done = False
+    print("="*55)
+
+    if all_done:
+        print("\n  All signs have 60 sequences!")
+        print("  Next steps:")
+        print("    1. python preprocess.py")
+        print("    2. python train.py\n")
+    else:
+        print("\n  Some signs still need more data.")
+        print("  Run this script again to continue.\n")
+
+
+if __name__ == '__main__':
+    collect_data()
+    

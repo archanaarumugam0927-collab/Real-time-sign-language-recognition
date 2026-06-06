@@ -1,0 +1,132 @@
+# ── IMPORTS ──────────────────────────────────────────────────────────────────
+import os, json, pickle
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from keras.utils import to_categorical
+
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL']  = '2'
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+DATA_PATH    = 'MP_Data'
+SEQUENCE_LEN = 30
+NUM_FEATURES = 1662
+TEST_SIZE    = 0.2
+OUTPUT_DIR   = 'processed'
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ── 1. LOAD ───────────────────────────────────────────────────────────────────
+actions = sorted([d for d in os.listdir(DATA_PATH)
+                  if os.path.isdir(os.path.join(DATA_PATH, d))])
+print(f"Classes: {actions}")
+
+sequences, labels = [], []
+
+for action in actions:
+    action_path = os.path.join(DATA_PATH, action)
+    seq_folders = sorted([f for f in os.listdir(action_path)
+                          if os.path.isdir(os.path.join(action_path, f))],
+                         key=lambda x: int(x))
+    for seq_folder in seq_folders:
+        seq_path    = os.path.join(action_path, seq_folder)
+        frame_files = sorted([f for f in os.listdir(seq_path)
+                               if f.endswith('.npy')],
+                             key=lambda x: int(x.replace('.npy', '')))
+        if not frame_files:
+            continue
+
+        frames = [np.load(os.path.join(seq_path, f)) for f in frame_files]
+        seq    = np.array(frames)
+
+        # Pad / trim
+        if seq.shape[0] < SEQUENCE_LEN:
+            pad = np.zeros((SEQUENCE_LEN - seq.shape[0], NUM_FEATURES))
+            seq = np.vstack([seq, pad])
+        else:
+            seq = seq[:SEQUENCE_LEN]
+
+        if seq.shape != (SEQUENCE_LEN, NUM_FEATURES):
+            print(f"  [SKIP] {action}/{seq_folder} shape {seq.shape}")
+            continue
+
+        sequences.append(seq)
+        labels.append(action)
+
+    print(f"  {action}: {labels.count(action)} loaded")
+
+print(f"\nTotal: {len(sequences)} sequences")
+
+# ── 2. ENCODE LABELS ──────────────────────────────────────────────────────────
+le        = LabelEncoder()
+y_encoded = le.fit_transform(labels)
+label_map = {cls: int(i) for i, cls in enumerate(le.classes_)}
+print(f"Label map: {label_map}")
+
+# ── 3. NORMALIZE ──────────────────────────────────────────────────────────────
+# Global normalization — fit on ALL data then apply
+# This is correct when there is NO augmentation
+X = np.array(sequences, dtype=np.float32)  # (360, 30, 1662)
+
+# Flatten to compute global mean/std across all frames and features
+mean = X.mean(axis=(0, 1), keepdims=True)  # (1, 1, 1662)
+std  = X.std(axis=(0, 1),  keepdims=True)
+std  = np.where(std == 0, 1.0, std)
+X    = (X - mean) / std
+
+print(f"X shape after normalization: {X.shape}")
+print(f"X mean: {X.mean():.4f}  std: {X.std():.4f}  (should be ~0 and ~1)")
+
+# Save normalisation stats so inference.py can use the same values
+np.save(os.path.join(OUTPUT_DIR, 'norm_mean.npy'), mean)
+np.save(os.path.join(OUTPUT_DIR, 'norm_std.npy'),  std)
+
+# ── 4. SPLIT ──────────────────────────────────────────────────────────────────
+# No augmentation — clean split on real data only
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_encoded,
+    test_size=TEST_SIZE,
+    random_state=42,
+    stratify=y_encoded   # equal class distribution in both sets
+)
+
+y_train_cat = to_categorical(y_train, num_classes=len(actions))
+y_test_cat  = to_categorical(y_test,  num_classes=len(actions))
+
+print(f"\nTrain: {X_train.shape}  Test: {X_test.shape}")
+print("Class distribution in test set:")
+for cls in le.classes_:
+    idx = label_map[cls]
+    print(f"  {cls}: {int(np.sum(y_test == idx))}")
+
+# ── 5. SAVE ───────────────────────────────────────────────────────────────────
+np.save(os.path.join(OUTPUT_DIR, 'X_train.npy'), X_train)
+np.save(os.path.join(OUTPUT_DIR, 'X_test.npy'),  X_test)
+np.save(os.path.join(OUTPUT_DIR, 'y_train.npy'), y_train_cat)
+np.save(os.path.join(OUTPUT_DIR, 'y_test.npy'),  y_test_cat)
+
+with open(os.path.join(OUTPUT_DIR, 'label_map.json'), 'w') as f:
+    json.dump(label_map, f, indent=2)
+with open(os.path.join(OUTPUT_DIR, 'label_encoder.pkl'), 'wb') as f:
+    pickle.dump(le, f)
+
+config = {
+    'sequence_len' : SEQUENCE_LEN,
+    'num_features' : NUM_FEATURES,
+    'num_classes'  : len(actions),
+    'actions'      : actions,
+    'label_map'    : label_map,
+    'train_samples': int(X_train.shape[0]),
+    'test_samples' : int(X_test.shape[0])
+}
+with open(os.path.join(OUTPUT_DIR, 'config.json'), 'w') as f:
+    json.dump(config, f, indent=2)
+
+print(f"""
+Preprocessing done — NO augmentation, clean split.
+  Train : {X_train.shape}   ({X_train.shape[0]} sequences)
+  Test  : {X_test.shape}    ({X_test.shape[0]} sequences)
+
+Next -> python train.py
+""")

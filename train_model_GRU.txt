@@ -1,0 +1,200 @@
+# ── IMPORTS ──────────────────────────────────────────────────────────────────
+import os, json, pickle
+import numpy as np
+import matplotlib.pyplot as plt
+
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL']  = '2'
+
+from keras.models import Sequential
+from keras.layers import GRU, Dense, Dropout, Input
+from keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from keras.optimizers import Adam
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+PROCESSED_DIR = 'processed'
+MODEL_DIR     = 'models_gru'
+EPOCHS        = 200
+BATCH_SIZE    = 16
+LR            = 0.001
+PATIENCE      = 30
+
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+# ── 1. LOAD ───────────────────────────────────────────────────────────────────
+print("\n[1] Loading data...")
+X_train = np.load(os.path.join(PROCESSED_DIR, 'X_train.npy'))
+X_test  = np.load(os.path.join(PROCESSED_DIR, 'X_test.npy'))
+y_train = np.load(os.path.join(PROCESSED_DIR, 'y_train.npy'))
+y_test  = np.load(os.path.join(PROCESSED_DIR, 'y_test.npy'))
+
+with open(os.path.join(PROCESSED_DIR, 'config.json')) as f:
+    config = json.load(f)
+with open(os.path.join(PROCESSED_DIR, 'label_encoder.pkl'), 'rb') as f:
+    le = pickle.load(f)
+
+SEQ_LEN    = config['sequence_len']   # 30
+N_FEATURES = config['num_features']   # 1662
+N_CLASSES  = config['num_classes']    # 6
+ACTIONS    = config['actions']
+
+print(f"  Train : {X_train.shape}")
+print(f"  Test  : {X_test.shape}")
+print(f"  Signs : {ACTIONS}")
+
+# ── 2. MODEL ──────────────────────────────────────────────────────────────────
+# Why GRU?
+# GRU has 2 gates (reset + update) vs LSTM's 3 gates (input, forget, output).
+# ~25% fewer parameters than an equivalent LSTM → faster training,
+# less overfitting risk on small datasets like ours (288 train sequences).
+# Performance on short gesture sequences is typically on par with LSTM.
+
+print("\n[2] Building GRU model...")
+
+model = Sequential([
+    Input(shape=(SEQ_LEN, N_FEATURES)),
+
+    GRU(64, return_sequences=True, activation='tanh'),
+    Dropout(0.4),
+
+    GRU(64, return_sequences=False, activation='tanh'),
+    Dropout(0.4),
+
+    Dense(32, activation='relu'),
+    Dropout(0.3),
+
+    Dense(N_CLASSES, activation='softmax')
+])
+
+model.compile(
+    optimizer=Adam(learning_rate=LR),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+model.summary()
+print(f"\n  Parameters: {model.count_params():,}")
+
+# ── 3. CALLBACKS ──────────────────────────────────────────────────────────────
+callbacks = [
+    EarlyStopping(
+        monitor='val_accuracy',
+        patience=PATIENCE,
+        restore_best_weights=True,
+        verbose=1
+    ),
+    ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=10,
+        min_lr=1e-6,
+        verbose=1
+    ),
+    ModelCheckpoint(
+        filepath=os.path.join(MODEL_DIR, 'best_model_gru.keras'),
+        monitor='val_accuracy',
+        save_best_only=True,
+        verbose=0
+    )
+]
+
+# ── 4. TRAIN ──────────────────────────────────────────────────────────────────
+print("\n[3] Training GRU...\n")
+history = model.fit(
+    X_train, y_train,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    validation_data=(X_test, y_test),
+    callbacks=callbacks,
+    verbose=1
+)
+
+# ── 5. EVALUATE ───────────────────────────────────────────────────────────────
+print("\n[4] Evaluating...")
+loss, acc = model.evaluate(X_test, y_test, verbose=0)
+print(f"\n  Test Accuracy : {acc * 100:.2f}%")
+print(f"  Test Loss     : {loss:.4f}")
+
+y_pred = np.argmax(model.predict(X_test, verbose=0), axis=1)
+y_true = np.argmax(y_test, axis=1)
+print("\n  Per-class report:")
+print(classification_report(y_true, y_pred, target_names=le.classes_))
+
+# ── 6. SAVE ───────────────────────────────────────────────────────────────────
+print("\n[5] Saving...")
+model.save(os.path.join(MODEL_DIR, 'sign_model_gru_final.keras'))
+model.save(os.path.join(MODEL_DIR, 'sign_model_gru_final.h5'))
+
+meta = {
+    'actions'      : ACTIONS,
+    'label_map'    : config['label_map'],
+    'sequence_len' : SEQ_LEN,
+    'num_features' : N_FEATURES,
+    'num_classes'  : N_CLASSES,
+    'test_accuracy': round(float(acc), 4),
+    'epochs_run'   : len(history.history['accuracy'])
+}
+with open(os.path.join(MODEL_DIR, 'model_meta.json'), 'w') as f:
+    json.dump(meta, f, indent=2)
+
+# ── 7. PLOTS ──────────────────────────────────────────────────────────────────
+print("\n[6] Saving plots...")
+ep = range(1, len(history.history['accuracy']) + 1)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle('GRU Training History', fontsize=14)
+
+axes[0].plot(ep, history.history['accuracy'],     label='Train', color='steelblue')
+axes[0].plot(ep, history.history['val_accuracy'], label='Val',   color='coral')
+axes[0].set_title('Accuracy')
+axes[0].set_xlabel('Epoch')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+axes[1].plot(ep, history.history['loss'],     label='Train', color='steelblue')
+axes[1].plot(ep, history.history['val_loss'], label='Val',   color='coral')
+axes[1].set_title('Loss')
+axes[1].set_xlabel('Epoch')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(os.path.join(MODEL_DIR, 'training_curves_gru.png'), dpi=150)
+plt.show()
+
+# Confusion matrix
+fig2, ax2 = plt.subplots(figsize=(8, 6))
+ConfusionMatrixDisplay(
+    confusion_matrix(y_true, y_pred),
+    display_labels=le.classes_
+).plot(ax=ax2, cmap='Greens', colorbar=False)
+ax2.set_title('GRU Confusion Matrix — Test Set')
+plt.tight_layout()
+plt.savefig(os.path.join(MODEL_DIR, 'confusion_matrix_gru.png'), dpi=150)
+plt.show()
+
+# ── RESULT ────────────────────────────────────────────────────────────────────
+train_best = max(history.history['val_accuracy'])
+gap        = max(history.history['accuracy']) - train_best
+
+print(f"""
+╔══════════════════════════════════════════╗
+║         GRU TRAINING COMPLETE            ║
+╠══════════════════════════════════════════╣
+║  Test Accuracy  : {acc*100:>6.2f}%               ║
+║  Best Val Acc   : {train_best*100:>6.2f}%               ║
+║  Overfit gap    : {gap*100:>6.2f}%               ║
+╠══════════════════════════════════════════╣""")
+
+if gap > 0.25:
+    print("║  Diagnosis : Still overfitting           ║")
+    print("║  Action    : Collect 30 more per sign    ║")
+elif acc < 0.65:
+    print("║  Diagnosis : Underfitting                ║")
+    print("║  Action    : Check data quality          ║")
+else:
+    print("║  Diagnosis : Good — ready for inference  ║")
+    print("║  Next      : update inference.py path    ║")
+
+print("╚══════════════════════════════════════════╝")
